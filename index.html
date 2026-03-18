@@ -40,11 +40,21 @@ button:disabled{opacity:.6;cursor:not-allowed}
   background:radial-gradient(circle at 50% 45%,#ff6b6b 0%,#e31616 35%,#7a0d0d 75%,#2a0707 100%);
   box-shadow:0 0 40px rgba(255,60,60,.45),0 0 120px rgba(255,40,40,.25);
   animation:pulse 1.2s infinite}
+.eye.arrived{background:radial-gradient(circle at 50% 45%,#8bffb1 0%,#2bd95e 40%,#0f7d34 72%,#063817 100%);box-shadow:0 0 40px rgba(68,255,120,.55),0 0 120px rgba(68,255,120,.3);animation:arrivalFlash .55s infinite}
 @keyframes pulse{0%,70%{filter:brightness(1)}100%{filter:brightness(1.6)}}
+@keyframes arrivalFlash{0%,100%{filter:brightness(.9)}50%{filter:brightness(1.9)}}
 .tick{position:absolute;left:50%;top:42%;transform-origin:50% 50%;
   transform:translate(-50%,-50%) rotate(0deg);
   width:40%;height:2px;background:linear-gradient(90deg,rgba(255,60,60,0) 0%,rgba(255,60,60,.6) 100%);
   border-radius:2px;opacity:.8}
+.tick.hidden{opacity:0}
+.arrowWrap{position:absolute;left:50%;top:42%;width:66%;height:66%;transform:translate(-50%,-50%);pointer-events:none}
+.arrow{position:absolute;left:50%;top:50%;width:34%;height:4px;background:linear-gradient(90deg,#35b6c3 0%,#8ef3ff 100%);border-radius:999px;
+  transform-origin:0 50%;transform:rotate(0deg);box-shadow:0 0 14px rgba(53,182,195,.5)}
+.arrow::after{content:'';position:absolute;right:-6px;top:50%;width:16px;height:16px;border-top:4px solid #8ef3ff;border-right:4px solid #8ef3ff;transform:translateY(-50%) rotate(45deg);border-radius:2px}
+.statusRow{display:flex;justify-content:center;gap:8px;margin-top:8px;flex-wrap:wrap}
+.badge{padding:4px 10px;border-radius:999px;border:1px solid #234055;background:#0e1823;color:#9bd8df;font-size:12px;letter-spacing:.08em;text-transform:uppercase}
+.badge.active{border-color:#35b6c3;color:#d8fbff;box-shadow:0 0 14px rgba(53,182,195,.3)}
 .panel{position:absolute;left:50%;bottom:6%;transform:translateX(-50%);width:86%;max-width:520px;
   padding:10px 12px;border-radius:12px;background:linear-gradient(180deg,#0f141b,#0b0f15);border:1px solid #1c2532;text-align:center;
   box-shadow:0 6px 24px rgba(0,0,0,.35),inset 0 0 30px rgba(0,0,0,.25)}
@@ -81,9 +91,14 @@ button:disabled{opacity:.6;cursor:not-allowed}
       <div class="ring"></div><div class="ring r2"></div><div class="ring r3"></div><div class="ring r4"></div>
       <div class="eye" id="eye"></div>
       <div class="tick" id="tick"></div>
+      <div class="arrowWrap"><div class="arrow" id="arrow"></div></div>
       <div class="panel">
         <div class="label" id="labelDisplay">Beacon</div>
         <div class="tiny" id="aux">Tap ENABLE LOCATION, then ARM for audio.</div>
+        <div class="statusRow">
+          <div class="badge active" id="headingBadge">Find heading</div>
+          <div class="badge" id="rangeBadge">Scanning</div>
+        </div>
         <div class="tiny" id="geoMsg"></div>
       </div>
     </div>
@@ -171,27 +186,71 @@ function initAdmin(){
 }
 
 /* ================== Player (beacon) ================== */
-const eye=$('eye'),tick=$('tick'),geoMsg=$('geoMsg'),aux=$('aux');
+const eye=$('eye'),tick=$('tick'),arrow=$('arrow'),geoMsg=$('geoMsg'),aux=$('aux');
+const headingBadge=$('headingBadge'),rangeBadge=$('rangeBadge');
 const locBtn=$('locBtn'),armBtn=$('armBtn'),testBeepBtn=$('testBeepBtn');
 
-let audioCtx=null,gainNode=null,armed=false,beepTimer=null,sweepRAF=null;
+let audioCtx=null,gainNode=null,armed=false,beepTimer=null,sweepRAF=null,arrivalOsc=null,arrivalGain=null;
+let watchId=null,orientationCleanup=null,lastHeading=null,lastDistance=Infinity,arrivalActive=false;
 function ensureAudio(){ if(audioCtx) return; audioCtx=new (window.AudioContext||window.webkitAudioContext)(); gainNode=audioCtx.createGain(); gainNode.gain.value=0.0001; gainNode.connect(audioCtx.destination); }
 async function unlockAudio(){ ensureAudio(); try{await audioCtx.resume();}catch{} const now=audioCtx.currentTime,o=audioCtx.createOscillator(),g=audioCtx.createGain(); o.type='sine'; o.frequency.setValueAtTime(440,now); g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); o.start(now); o.stop(now+0.05); }
 function pip(freq=800,ms=90){
-  if(!audioCtx) return;
+  if(!audioCtx || arrivalActive) return;
   const now=audioCtx.currentTime, o=audioCtx.createOscillator(); o.type='sine'; o.frequency.setValueAtTime(freq,now); o.connect(gainNode);
   const g=gainNode.gain; g.cancelScheduledValues(now); g.setValueAtTime(0.0001,now); g.linearRampToValueAtTime(0.4,now+0.015); g.exponentialRampToValueAtTime(0.0001,now+ms/1000);
   o.start(now); o.stop(now+ms/1000+.05); navigator.vibrate?.(12);
 }
-function cadence(d){ if(d>800)return{it:1400,f:420}; if(d>300)return{it:900,f:500}; if(d>120)return{it:600,f:620}; if(d>40)return{it:380,f:760}; if(d>15)return{it:260,f:900}; if(d>6)return{it:180,f:1020}; return{it:120,f:1200}; }
-function schedule(it,f){ if(schedule._it===it) return; schedule._it=it; clearInterval(beepTimer); pip(f); beepTimer=setInterval(()=>pip(f),Math.max(120,it)); }
+function cadence(d){ if(d>800)return{it:1400,f:420,label:'Far'}; if(d>300)return{it:900,f:500,label:'Closing'}; if(d>120)return{it:600,f:620,label:'Closer'}; if(d>40)return{it:380,f:760,label:'Very close'}; if(d>15)return{it:260,f:900,label:'Almost there'}; if(d>6)return{it:180,f:1020,label:'On top of it'}; return{it:120,f:1200,label:'Arrived'}; }
+function stopArrivalTone(){
+  if(arrivalGain && audioCtx){ const now=audioCtx.currentTime; arrivalGain.gain.cancelScheduledValues(now); arrivalGain.gain.setTargetAtTime(0.0001, now, 0.04); }
+  if(arrivalOsc){ try{ arrivalOsc.stop(audioCtx.currentTime+0.08); }catch{} }
+  arrivalOsc=null; arrivalGain=null; arrivalActive=false;
+}
+function startArrivalTone(){
+  if(!audioCtx || arrivalActive) return;
+  clearInterval(beepTimer); schedule._it=null;
+  const now=audioCtx.currentTime; arrivalOsc=audioCtx.createOscillator(); arrivalGain=audioCtx.createGain();
+  arrivalOsc.type='sine'; arrivalOsc.frequency.setValueAtTime(1320, now); arrivalGain.gain.setValueAtTime(0.0001, now);
+  arrivalGain.gain.linearRampToValueAtTime(0.22, now+0.08); arrivalOsc.connect(arrivalGain); arrivalGain.connect(audioCtx.destination); arrivalOsc.start(now); arrivalActive=true;
+  navigator.vibrate?.([60,40,60,40,120]);
+}
+function schedule(it,f){ if(arrivalActive) return; if(schedule._it===it) return; schedule._it=it; clearInterval(beepTimer); pip(f); beepTimer=setInterval(()=>pip(f),Math.max(120,it)); }
 function sweep(rps){ if(sweep._rps===rps) return; sweep._rps=rps; cancelAnimationFrame(sweepRAF); let start=null; function step(t){ if(!start) start=t; const e=(t-start)/1000; tick.style.transform=`translate(-50%,-50%) rotate(${(e*rps*360)%360}deg)`; sweepRAF=requestAnimationFrame(step); } sweepRAF=requestAnimationFrame(step); }
+function bearingBetween(a,b,c,d){
+  const φ1=toRad(a), φ2=toRad(c), λ1=toRad(b), λ2=toRad(d);
+  const y=Math.sin(λ2-λ1)*Math.cos(φ2);
+  const x=Math.cos(φ1)*Math.sin(φ2)-Math.sin(φ1)*Math.cos(φ2)*Math.cos(λ2-λ1);
+  return (Math.atan2(y,x)*180/Math.PI+360)%360;
+}
+function setHeadingStatus(msg,active=false){ headingBadge.textContent=msg; headingBadge.classList.toggle('active',active); }
+function setRangeStatus(msg,active=true){ rangeBadge.textContent=msg; rangeBadge.classList.toggle('active',active); }
+function updateArrowToBearing(targetBearing){
+  if(lastHeading==null){ arrow.style.transform='rotate(0deg)'; setHeadingStatus('Find heading', false); return; }
+  const relative=((targetBearing-lastHeading+540)%360)-180;
+  arrow.style.transform=`rotate(${relative}deg)`;
+  const dir = Math.abs(relative)<=15 ? 'Ahead' : relative>0 ? 'Turn right' : 'Turn left';
+  setHeadingStatus(`${dir} ${Math.round(Math.abs(relative))}°`, true);
+}
+function enableOrientation(){
+  if(orientationCleanup) return;
+  const handler=(event)=>{
+    const raw = Number.isFinite(event.webkitCompassHeading) ? event.webkitCompassHeading : (Number.isFinite(event.alpha) ? 360-event.alpha : null);
+    if(!Number.isFinite(raw)) return;
+    lastHeading=(raw+360)%360;
+    if(ACTIVE_TARGET && Number.isFinite(lastDistance)) updateArrowToBearing(bearingBetween(currentCoords.lat,currentCoords.lng,ACTIVE_TARGET.lat,ACTIVE_TARGET.lng));
+  };
+  const attach=()=>{ window.addEventListener('deviceorientation', handler, true); orientationCleanup=()=>window.removeEventListener('deviceorientation', handler, true); };
+  if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){
+    DeviceOrientationEvent.requestPermission().then(state=>{ if(state==='granted') attach(); else setHeadingStatus('Heading blocked', false); }).catch(()=>setHeadingStatus('Heading blocked', false));
+  }else{ attach(); }
+}
 
-['click','touchend'].forEach(ev=>armBtn.addEventListener(ev, async ()=>{ await unlockAudio(); armed=true; armBtn.disabled=true; armBtn.textContent='ARMED'; aux.textContent='Tracking active.'; pip(880,120); }, {passive:true}));
+['click','touchend'].forEach(ev=>armBtn.addEventListener(ev, async ()=>{ await unlockAudio(); armed=true; armBtn.disabled=true; armBtn.textContent='ARMED'; aux.textContent='Tracking active.'; enableOrientation(); if(lastDistance<=6){ startArrivalTone(); } else { pip(880,120); } }, {passive:true}));
 ['click','touchend'].forEach(ev=>testBeepBtn.addEventListener(ev, async ()=>{ await unlockAudio(); pip(740,120); }, {passive:true}));
 
 /* ================== Geolocation + target resolution ================== */
 let ACTIVE_TARGET = null;
+let currentCoords = { lat: 0, lng: 0 };
 
 async function resolveTargetFromLink(){
   const qs = new URLSearchParams(location.search);
@@ -221,16 +280,33 @@ function explainGeo(err){
 }
 function onGeoOK(pos){
   geoMsg.textContent='Location active.';
-  const {latitude,longitude}=pos.coords;
+  const {latitude,longitude,heading}=pos.coords;
+  currentCoords = { lat: latitude, lng: longitude };
+  if(Number.isFinite(heading)) lastHeading = heading;
   if(!ACTIVE_TARGET){ aux.textContent='(No target in link)'; return; }
   const d=haversine(latitude,longitude,ACTIVE_TARGET.lat,ACTIVE_TARGET.lng);
-  // distance is used internally for cadence/beeps but NOT displayed
-  const {it,f}=cadence(d); eye.style.animationDuration=Math.max(0.3,it/900)+'s'; sweep(Math.max(0.8,3000/it)); if(armed) schedule(it,f);
-  if(d<=6){ eye.style.filter='brightness(2)'; navigator.vibrate?.([20,60,20,60]); }
+  lastDistance=d;
+  const targetBearing=bearingBetween(latitude,longitude,ACTIVE_TARGET.lat,ACTIVE_TARGET.lng);
+  updateArrowToBearing(targetBearing);
+  const {it,f,label}=cadence(d);
+  setRangeStatus(label, true);
+  aux.textContent = d<=6 ? 'Target acquired.' : `Signal ${label.toLowerCase()}. Keep moving.`;
+  eye.style.animationDuration=Math.max(0.3,it/900)+'s';
+  if(d<=6){
+    tick.classList.add('hidden');
+    eye.classList.add('arrived');
+    if(armed) startArrivalTone();
+  }else{
+    eye.classList.remove('arrived');
+    tick.classList.remove('hidden');
+    stopArrivalTone();
+    sweep(Math.max(0.8,3000/it));
+    if(armed) schedule(it,f);
+  }
 }
 function onGeoErr(err){ geoMsg.textContent = explainGeo(err); $('locBtn').disabled=false; $('locBtn').textContent='ENABLE LOCATION'; }
-function requestOnce(){ if(!navigator.geolocation){ geoMsg.textContent='Geolocation not supported'; return; } navigator.geolocation.getCurrentPosition(onGeoOK,onGeoErr,{enableHighAccuracy:true,timeout:15000,maximumAge:0}); }
-function startWatch(){ if(!navigator.geolocation) return; navigator.geolocation.watchPosition(onGeoOK,onGeoErr,{enableHighAccuracy:true,timeout:20000,maximumAge:2000}); }
+function requestOnce(){ if(!navigator.geolocation){ geoMsg.textContent='Geolocation not supported'; return; } enableOrientation(); $('locBtn').disabled=true; $('locBtn').textContent='LOCATING…'; navigator.geolocation.getCurrentPosition(onGeoOK,onGeoErr,{enableHighAccuracy:true,timeout:15000,maximumAge:0}); }
+function startWatch(){ if(!navigator.geolocation || watchId!=null) return; watchId = navigator.geolocation.watchPosition(onGeoOK,onGeoErr,{enableHighAccuracy:true,timeout:20000,maximumAge:2000}); }
 ['click','touchend'].forEach(ev=>$('locBtn').addEventListener(ev, requestOnce, {passive:true}));
 
 /* ================== Boot ================== */
